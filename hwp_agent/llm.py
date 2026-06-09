@@ -36,7 +36,9 @@ op 종류:
      {{"strategy":"cell_by_row_col","row_index":<행>,"col_index":<열>}}]}},
   "action":{{"kind":"set_cell_text","new_value":"<새 값>"}}}}
    - 신청서/양식처럼 "항목명 | 값" 구조면 cell_by_label을 우선 사용(병합셀에 강함):
-     {{"strategy":"cell_by_label","label_text":"<항목명 예: 과제명>","direction":"right"}}  (direction: right/below/left/above)
+     {{"strategy":"cell_by_label","label_text":"<항목명 예: 과제명>","direction":"right"}}
+     · table_index는 몰라도 됨(시스템이 라벨로 표를 자동 탐색). 대충 0 또는 본 것 중 하나를 넣어도 됨.
+     · direction은 기본 "right". 시스템이 비어있는 인접칸(값 칸)을 자동 선택하므로 보통 "right"로 두면 됨.
    - 헤더 표는 cell_by_header: {{"strategy":"cell_by_header","header_name":"<헤더>","row_index":1,"row_mode":"data_row"}}
    - row/col 숫자 지정은 병합 없는 단순표에서만 신뢰성 높음(병합셀은 cell_by_label 권장).
 3) 이미지 교체

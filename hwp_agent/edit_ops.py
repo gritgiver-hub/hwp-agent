@@ -117,6 +117,72 @@ def _find_label_rc(grid: List[List[str]], label: str, contains: bool = True):
     return None
 
 
+def _table_has_label(table: Dict[str, Any], label: str) -> bool:
+    lab = _norm(label)
+    cells = list(table.get("headers", []))
+    for row in table.get("sample_rows", []):
+        cells += list(row)
+    return any(lab in _norm(x) for x in cells)
+
+
+def _table_with_label(index: Dict[str, Any], label: str, hint_n=None):
+    """Pick the table to fill by *label presence* (across the whole index), so the
+    LLM doesn't have to guess the right table_index among many. Prefer the hinted
+    table if it contains the label; else the first table that does; else the hint."""
+    tables = index.get("tables", [])
+    by_n = {t["table_n"]: t for t in tables}
+    if hint_n is not None and hint_n in by_n and _table_has_label(by_n[hint_n], label):
+        return by_n[hint_n]
+    for t in tables:
+        if _table_has_label(t, label):
+            return t
+    return by_n.get(hint_n)
+
+
+def _neighbor(r1: int, c1: int, direction: str):
+    return {"right": (r1, c1 + 1), "below": (r1 + 1, c1),
+            "left": (r1, c1 - 1), "above": (r1 - 1, c1)}.get(direction, (r1, c1 + 1))
+
+
+def _smart_label_target(hwp, index, label, hint_n, llm_dir):
+    """Resolve (table, target cell, direction) for a label-anchored fill by reading
+    candidate tables' grids and preferring a *fillable* (empty) adjacent cell. This
+    fixes the two hard cases of LLM form-filling: a wrong direction guess (value is
+    usually in the empty neighbour) and the same label appearing in several tables
+    (pick the one with a blank slot). Returns
+    (score, table_n, label_rc, target_rc, direction, before) or None."""
+    tables = index.get("tables", [])
+    cand_tn = [t["table_n"] for t in tables if _table_has_label(t, label)]
+    if not cand_tn:
+        cand_tn = [hint_n] if hint_n is not None else [t["table_n"] for t in tables]
+    dirs = []
+    for d in (llm_dir, "right", "below"):
+        if d in ("right", "below", "left", "above") and d not in dirs:
+            dirs.append(d)
+    best = None
+    for tn in cand_tn:
+        if tn is None:
+            continue
+        try:
+            grid = _grid(hwp, tn)
+        except Exception:
+            continue
+        rc = _find_label_rc(grid, label)
+        if rc is None:
+            continue
+        r, c = rc
+        for d in dirs:
+            tr, tc = _neighbor(r, c, d)
+            if not (1 <= tr <= len(grid) and grid and 1 <= tc <= len(grid[0])):
+                continue
+            val = _norm(grid[tr - 1][tc - 1])
+            score = (3 if val == "" else 0) + (2 if d == llm_dir else 0) \
+                + (1 if tn == hint_n else 0) + (0.5 if d == "right" else 0)
+            if best is None or score > best[0]:
+                best = (score, tn, (r, c), (tr, tc), d, val)
+    return best
+
+
 def _set_cell_by_label(hwp, table_n: int, label: str, direction: str, value: str):
     """Fill the cell adjacent to a label cell (robust for merged 'label | value'
     forms): find the (non-merged) label cell, goto its address, step into the
@@ -213,22 +279,36 @@ def _image_name(hwp, ctrl) -> str:
         return ""
 
 
+# Size + placement properties to carry over when swapping a picture, so both
+# inline (TreatAsChar=1) and floating images keep their geometry/anchor.
+_GEOM_PROPS = (
+    "Width", "Height", "WidthRelTo", "HeightRelTo", "TreatAsChar",
+    "HorzAlign", "HorzRelTo", "HorzOffset", "VertAlign", "VertRelTo", "VertOffset",
+    "TextWrap", "FlowWithText", "AllowOverlap", "NumberingType",
+    "OutsideMarginLeft", "OutsideMarginRight", "OutsideMarginTop", "OutsideMarginBottom",
+)
+
+
 def _replace_image(hwp, ordinal1: int, path: str):
-    """Swap a picture's content while preserving its size (and treat-as-char /
-    position): read the target gso's geometry, delete it, re-insert the new image
-    at the same caret position, then restore Width/Height. Returns (new_ctrl,
-    (W, H)). pyhwpx's get_image_info(name) lets the caller verify the swap."""
+    """Swap a picture's content while preserving geometry + placement. Capture the
+    target gso's size/anchor properties, delete it, re-insert the new image at the
+    same caret position, then restore every captured property (so floating images
+    keep their absolute position, not just size). Returns (new_ctrl, geom_dict).
+    get_image_info(name) lets the caller verify the swap landed."""
     gsos = _gso_list(hwp)
     if not (1 <= ordinal1 <= len(gsos)):
         raise RuntimeError(f"image ordinal {ordinal1} out of range (have {len(gsos)})")
     target = gsos[ordinal1 - 1]
     props = target.Properties
-    W = props.Item("Width")
-    H = props.Item("Height")
-    try:
-        tac = props.Item("TreatAsChar")
-    except Exception:
-        tac = 1
+    geom = {}
+    for k in _GEOM_PROPS:
+        try:
+            v = props.Item(k)
+            if v is not None:
+                geom[k] = v
+        except Exception:
+            pass
+    tac = geom.get("TreatAsChar", 1)
     try:
         pos = hwp.get_ctrl_pos(target)
     except Exception:
@@ -242,10 +322,14 @@ def _replace_image(hwp, ordinal1: int, path: str):
             pass
     newc = hwp.insert_picture(os.path.abspath(path), treat_as_char=bool(tac))
     try:
-        _set_ctrl_props(newc, Width=W, Height=H)
+        _set_ctrl_props(newc, **geom)
     except Exception:
-        pass
-    return newc, (W, H)
+        # fall back to size-only if the full set is rejected
+        try:
+            _set_ctrl_props(newc, Width=geom.get("Width"), Height=geom.get("Height"))
+        except Exception:
+            pass
+    return newc, geom
 
 
 def _check_conditions(hwp, conds, ctx) -> Tuple[bool, List[str]]:
@@ -288,36 +372,31 @@ def resolve_and_apply(hwp, index: Dict[str, Any], op: Dict[str, Any], dry_run: b
               "confidence": 0.0, "ambiguous": False, "details": {}, "errors": []}
 
     if typ == "table_set_cell":
-        table_selectors = [s for s in selectors if s.get("strategy", "").startswith("table_")]
-        cands = _score_tables(index, table_selectors)
-        result["details"]["candidates"] = [(c[1]["table_n"], round(c[0], 2), c[2]) for c in cands[:5]]
-        if not cands:
-            result["code"] = "TARGET_NOT_FOUND"; return result
-        gate = _gate(cands[0][0], [(c[0], c[1]) for c in cands], op, result)
-        if gate:
-            result["code"] = gate; return result
-        table = cands[0][1]
         cell_sel = next((s for s in selectors if s.get("strategy", "").startswith("cell_")), None)
         if not cell_sel:
             result["code"] = "BAD_SELECTOR"; result["errors"].append("missing cell selector"); return result
-        tn = table["table_n"]
+        table_selectors = [s for s in selectors if s.get("strategy", "").startswith("table_")]
         new_value = _norm(action.get("new_value", ""))
 
-        # --- label-anchored cell (robust for merged 'label | value' forms) ---
+        # --- label-anchored cell (robust for merged 'label | value' forms).
+        #     Resolve the table by LABEL across the whole index, so a wrong/absent
+        #     table_index from the LLM doesn't break it. ---
         if cell_sel.get("strategy") == "cell_by_label":
             label = cell_sel.get("label_text", "") or cell_sel.get("header_name", "")
-            direction = cell_sel.get("direction", "right")
+            llm_dir = cell_sel.get("direction", "right")
+            hint = next((s.get("table_index") for s in table_selectors
+                         if s.get("strategy") == "table_by_index"), None)
             try:
-                grid = _grid(hwp, tn)
-                rc = _find_label_rc(grid, label)
-                if rc is None:
-                    result["code"] = "RESOLVE_FAILED"
-                    result["errors"].append(f"label not found: {label!r}"); return result
-                tr, tc = {"right": (rc[0], rc[1] + 1), "below": (rc[0] + 1, rc[1]),
-                          "left": (rc[0], rc[1] - 1), "above": (rc[0] - 1, rc[1])}.get(direction, (rc[0], rc[1] + 1))
-                before = grid[tr - 1][tc - 1] if (1 <= tr <= len(grid) and grid and 1 <= tc <= len(grid[0])) else ""
+                best = _smart_label_target(hwp, index, label, hint, llm_dir)
             except Exception as e:
                 result["code"] = "RESOLVE_FAILED"; result["errors"].append(str(e)); return result
+            if best is None:
+                result["code"] = "TARGET_NOT_FOUND"
+                result["errors"].append(f"label not found in any table: {label!r}"); return result
+            _, tn, label_rc, target_rc, direction, before = best
+            tr, tc = target_rc
+            result["details"]["candidates"] = [(tn, "by_label", [direction])]
+            result["confidence"] = 0.85
             if dry_run or op.get("dry_run"):
                 result.update(ok=True, code="DRY_RUN",
                               details={**result["details"], "table_n": tn, "label": label,
@@ -338,7 +417,16 @@ def resolve_and_apply(hwp, index: Dict[str, Any], op: Dict[str, Any], dry_run: b
                 result["code"] = "POSTCONDITION_FAILED"; result["errors"] += errs; return result
             result.update(ok=True, applied=True, code="OK"); return result
 
-        # --- positional cell (row/col or header) ---
+        # --- positional cell (row/col or header): score+gate the table by selectors ---
+        cands = _score_tables(index, table_selectors)
+        result["details"]["candidates"] = [(c[1]["table_n"], round(c[0], 2), c[2]) for c in cands[:5]]
+        if not cands:
+            result["code"] = "TARGET_NOT_FOUND"; return result
+        gate = _gate(cands[0][0], [(c[0], c[1]) for c in cands], op, result)
+        if gate:
+            result["code"] = gate; return result
+        table = cands[0][1]
+        tn = table["table_n"]
         try:
             row1, col1 = _resolve_cell(table, cell_sel)
             before = _cell_value(hwp, tn, row1, col1)
@@ -420,14 +508,15 @@ def resolve_and_apply(hwp, index: Dict[str, Any], op: Dict[str, Any], dry_run: b
             result["code"] = "RESOLVE_FAILED"
             result["errors"].append(f"new_image_path not found: {path!r}"); return result
         try:
-            _, (W, H) = _replace_image(hwp, ordinal, path)
+            _, geom = _replace_image(hwp, ordinal, path)
         except Exception as e:
             result["code"] = "APPLY_FAILED"; result["errors"].append(str(e)); return result
-        # auto-verify: same image count, and the addressed slot now holds the new file
+        # auto-verify: the addressed slot now holds the new file
         after_name = _image_name(hwp, _find_gso(hwp, ordinal))
         expect = os.path.basename(path)
         result["details"].update(image_ordinal=ordinal, new_image=expect,
-                                 width=W, height=H, after_name=after_name)
+                                 width=geom.get("Width"), height=geom.get("Height"),
+                                 treat_as_char=geom.get("TreatAsChar"), after_name=after_name)
         if after_name != expect:
             result["code"] = "VERIFY_FAILED"
             result["errors"].append(f"image after replace = {after_name!r} != {expect!r}"); return result

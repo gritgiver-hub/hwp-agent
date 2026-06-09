@@ -64,6 +64,57 @@ finally:
     except Exception: pass
 '''
 
+_GENERATE_CHILD = _PIDS + r'''
+import sys, json, os
+root, dst, blocksfile, pidfile = sys.argv[1:5]
+sys.path.insert(0, root)
+from pyhwpx import Hwp
+from hwp_agent import edit_ops as he
+blocks = json.load(open(blocksfile, encoding="utf-8"))
+before = hwp_pids()
+hwp = Hwp(new=True, visible=False)
+open(pidfile,"w").write(",".join(map(str, sorted(hwp_pids()-before))))
+try:
+    hwp.SetMessageBoxMode(0x2FFF1)
+    for b in blocks:
+        t = b.get("type")
+        try: hwp.MoveDocEnd()
+        except Exception: pass
+        if t in ("text", "heading"):
+            hwp.insert_text(b.get("text", ""))
+            if b.get("newline", True): hwp.insert_text("\n")
+        elif t == "table":
+            rows, cols = int(b["rows"]), int(b["cols"])
+            hwp.create_table(rows=rows, cols=cols, treat_as_char=True, header=bool(b.get("header", False)))
+            data = b.get("data") or []
+            for r in range(1, rows + 1):
+                for c in range(1, cols + 1):
+                    val = ""
+                    if r - 1 < len(data) and c - 1 < len(data[r - 1]):
+                        val = str(data[r - 1][c - 1])
+                    if val == "": continue
+                    hwp.get_into_nth_table(-1)
+                    if hwp.goto_addr(he._excel_addr(r, c)):
+                        he._clear_cell_and_type(hwp, val)
+            try: hwp.MoveDocEnd()
+            except Exception: pass
+            hwp.insert_text("\n")
+        elif t == "image":
+            p = os.path.abspath(b["path"])
+            if not os.path.exists(p):
+                print("ERR image not found: " + p, flush=True); continue
+            ctrl = hwp.insert_picture(p, treat_as_char=bool(b.get("treat_as_char", True)))
+            if b.get("width") and b.get("height"):
+                try: he._set_ctrl_props(ctrl, Width=int(b["width"]), Height=int(b["height"]))
+                except Exception: pass
+            hwp.insert_text("\n")
+    hwp.save_as(dst, "HWP")
+    print("DONE " + json.dumps({"saved": os.path.exists(dst)}), flush=True)
+finally:
+    try: hwp.quit()
+    except Exception: pass
+'''
+
 _APPLY_CHILD = _PIDS + r'''
 import sys, json
 root, src, dst, opsfile, pidfile = sys.argv[1:6]
@@ -150,5 +201,38 @@ def apply_edits(src, plan: Dict[str, Any], dst, policy=None, timeout: int = 120
         return False, results, f"timed out after {timeout}s (committed {len(results)} ops before hang)"
     finally:
         for f in (opsfile, pidfile):
+            try: pathlib.Path(f).unlink(missing_ok=True)
+            except Exception: pass
+
+
+def generate_document(dst, blocks: List[Dict[str, Any]], policy=None, timeout: int = 120
+                      ) -> Tuple[bool, str]:
+    """Create a NEW .hwp from a list of blocks (text/heading/table/image) in a
+    bounded child. Each block:
+      {"type":"heading"|"text", "text": str, "newline": bool}
+      {"type":"table", "rows": int, "cols": int, "data": [[...]], "header": bool}
+      {"type":"image", "path": str, "width": int, "height": int, "treat_as_char": bool}
+    """
+    dst = policy.resolve(dst) if policy else str(pathlib.Path(dst).resolve())
+    blocksfile = tempfile.NamedTemporaryFile(delete=False, suffix=".json").name
+    pidfile = tempfile.NamedTemporaryFile(delete=False, suffix=".pids").name
+    json.dump(blocks, open(blocksfile, "w", encoding="utf-8"), ensure_ascii=False)
+    proc = subprocess.Popen([sys.executable, "-u", "-c", _GENERATE_CHILD, _ROOT, dst, blocksfile, pidfile],
+                            stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
+                            encoding="utf-8", errors="ignore")
+    try:
+        out, _ = proc.communicate(timeout=timeout)
+        saved = False
+        for line in (out or "").splitlines():
+            if line.startswith("DONE "):
+                try: saved = json.loads(line[5:]).get("saved", False)
+                except Exception: pass
+        ok = saved and pathlib.Path(dst).exists() and pathlib.Path(dst).stat().st_size > 0
+        return ok, ("OK" if ok else (out or "").strip()[:300])
+    except subprocess.TimeoutExpired:
+        proc.kill(); _kill_pids(_read_owned(pidfile))
+        return False, f"timed out after {timeout}s"
+    finally:
+        for f in (blocksfile, pidfile):
             try: pathlib.Path(f).unlink(missing_ok=True)
             except Exception: pass

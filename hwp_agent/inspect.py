@@ -43,17 +43,21 @@ def _count_ctrls(hwp) -> Dict[str, int]:
 
 
 def _table_info(hwp, n: int) -> Dict[str, Any]:
+    # table_to_df promotes the table's first physical row to df.columns; include it
+    # as grid row 1 so the index uses the SAME physical-row coordinates as editing
+    # (goto_addr / _grid / cell_by_label). Otherwise the first row (often the labels)
+    # is missing from headers/sample_rows.
     df = hwp.table_to_df(n)
-    rows = [[_norm(x) for x in df.iloc[i].tolist()] for i in range(len(df))]
-    headers = rows[0] if rows else []
-    first_data = rows[1] if len(rows) > 1 else []
-    fp = "tbl:" + _sha({"shape": [len(df), df.shape[1]], "headers": headers, "first": first_data})[:20]
+    header_row = [_norm(x) for x in df.columns.tolist()]
+    grid = [header_row] + [[_norm(x) for x in df.iloc[i].tolist()] for i in range(len(df))]
+    first_data = grid[1] if len(grid) > 1 else []
+    fp = "tbl:" + _sha({"shape": [len(grid), len(header_row)], "headers": header_row, "first": first_data})[:20]
     return {
         "table_n": n,
-        "shape": {"rows": int(df.shape[0]), "cols": int(df.shape[1])},
-        "headers": headers,
+        "shape": {"rows": len(grid), "cols": len(header_row)},
+        "headers": header_row,
         "fingerprint": fp,
-        "sample_rows": rows[:3],
+        "sample_rows": grid[:3],
         "merged_cells_detected": False,  # v1 best-effort flag
     }
 
