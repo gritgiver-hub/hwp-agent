@@ -142,6 +142,21 @@ def test_table_set_cell_by_label_dry_run():
     assert r["details"]["before"] == "기존값" and r["details"]["after"] == "AX 디바이스 사업"
 
 
+def test_image_replace_dry_run_and_gate():
+    idx = _index_one_table()  # has one image, ordinal 1
+    op = {"op_id": "i1", "type": "image_replace", "min_confidence": 0.5,
+          "target": {"selector_chain": [{"strategy": "image_by_index", "image_index": 1}]},
+          "action": {"new_image_path": "/some/logo.png"}}
+    r = edit_ops.resolve_and_apply(None, idx, op, dry_run=True)
+    assert r["ok"] and r["code"] == "DRY_RUN" and r["details"]["image_ordinal"] == 1
+
+    op_miss = {"op_id": "i2", "type": "image_replace", "min_confidence": 0.5,
+               "target": {"selector_chain": [{"strategy": "image_by_index", "image_index": 9}]},
+               "action": {"new_image_path": "/x.png"}}
+    r2 = edit_ops.resolve_and_apply(None, idx, op_miss, dry_run=True)
+    assert not r2["ok"] and r2["code"] == "TARGET_NOT_FOUND"
+
+
 # ---- llm plan building (fake llm) ----
 
 def test_build_plan_with_fake_llm():

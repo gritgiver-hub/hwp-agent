@@ -10,6 +10,7 @@ gate), applies via pyhwpx, and verifies pre/postconditions. Op types:
 from __future__ import annotations
 
 import difflib
+import os
 import re
 from typing import Any, Dict, List, Tuple
 
@@ -183,16 +184,68 @@ def _resolve_cell(table, selector) -> Tuple[int, int]:
     raise ValueError(f"unsupported cell selector: {st}")
 
 
-def _find_gso(hwp, ordinal1: int):
-    i = 0
-    ctrl = getattr(hwp, "HeadCtrl", None)
+def _gso_list(hwp) -> List[Any]:
+    """All picture/drawing object ctrls (CtrlID == 'gso') in document order."""
+    out, ctrl = [], getattr(hwp, "HeadCtrl", None)
     while ctrl is not None:
         if (getattr(ctrl, "CtrlID", "") or "") == "gso":
-            i += 1
-            if i == ordinal1:
-                return ctrl
+            out.append(ctrl)
         ctrl = getattr(ctrl, "Next", None)
-    return None
+    return out
+
+
+def _find_gso(hwp, ordinal1: int):
+    gsos = _gso_list(hwp)
+    return gsos[ordinal1 - 1] if 1 <= ordinal1 <= len(gsos) else None
+
+
+def _set_ctrl_props(ctrl, **kv) -> None:
+    p = ctrl.Properties
+    for k, v in kv.items():
+        p.SetItem(k, v)
+    ctrl.Properties = p
+
+
+def _image_name(hwp, ctrl) -> str:
+    try:
+        return (hwp.get_image_info(ctrl) or {}).get("name", "")
+    except Exception:
+        return ""
+
+
+def _replace_image(hwp, ordinal1: int, path: str):
+    """Swap a picture's content while preserving its size (and treat-as-char /
+    position): read the target gso's geometry, delete it, re-insert the new image
+    at the same caret position, then restore Width/Height. Returns (new_ctrl,
+    (W, H)). pyhwpx's get_image_info(name) lets the caller verify the swap."""
+    gsos = _gso_list(hwp)
+    if not (1 <= ordinal1 <= len(gsos)):
+        raise RuntimeError(f"image ordinal {ordinal1} out of range (have {len(gsos)})")
+    target = gsos[ordinal1 - 1]
+    props = target.Properties
+    W = props.Item("Width")
+    H = props.Item("Height")
+    try:
+        tac = props.Item("TreatAsChar")
+    except Exception:
+        tac = 1
+    try:
+        pos = hwp.get_ctrl_pos(target)
+    except Exception:
+        pos = None
+    hwp.move_to_ctrl(target)
+    hwp.delete_ctrl(target)
+    if pos is not None:
+        try:
+            hwp.set_pos(*pos)
+        except Exception:
+            pass
+    newc = hwp.insert_picture(os.path.abspath(path), treat_as_char=bool(tac))
+    try:
+        _set_ctrl_props(newc, Width=W, Height=H)
+    except Exception:
+        pass
+    return newc, (W, H)
 
 
 def _check_conditions(hwp, conds, ctx) -> Tuple[bool, List[str]]:
@@ -363,19 +416,22 @@ def resolve_and_apply(hwp, index: Dict[str, Any], op: Dict[str, Any], dry_run: b
         if dry_run or op.get("dry_run"):
             result.update(ok=True, code="DRY_RUN", details={"image_ordinal": ordinal, "new_image_path": path})
             return result
+        if not path or not os.path.exists(path):
+            result["code"] = "RESOLVE_FAILED"
+            result["errors"].append(f"new_image_path not found: {path!r}"); return result
         try:
-            ctrl = _find_gso(hwp, ordinal)
-            if ctrl is None:
-                raise ValueError(f"image ordinal {ordinal} not found")
-            # experimental: select+delete the target object, insert replacement
-            _run(hwp, "SelectCtrlFront")
-            _run(hwp, "Delete")
-            hwp.insert_picture(path)
+            _, (W, H) = _replace_image(hwp, ordinal, path)
         except Exception as e:
             result["code"] = "APPLY_FAILED"; result["errors"].append(str(e)); return result
-        result.update(ok=True, applied=True, code="OK",
-                      details={"image_ordinal": ordinal, "note": "image geometry not preserved (v1)"})
-        return result
+        # auto-verify: same image count, and the addressed slot now holds the new file
+        after_name = _image_name(hwp, _find_gso(hwp, ordinal))
+        expect = os.path.basename(path)
+        result["details"].update(image_ordinal=ordinal, new_image=expect,
+                                 width=W, height=H, after_name=after_name)
+        if after_name != expect:
+            result["code"] = "VERIFY_FAILED"
+            result["errors"].append(f"image after replace = {after_name!r} != {expect!r}"); return result
+        result.update(ok=True, applied=True, code="OK"); return result
 
     result["code"] = "UNSUPPORTED_OP_TYPE"
     return result
