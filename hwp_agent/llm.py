@@ -35,7 +35,10 @@ op 종류:
   "target":{{"selector_chain":[{{"strategy":"table_by_index","table_index":<N>}},
      {{"strategy":"cell_by_row_col","row_index":<행>,"col_index":<열>}}]}},
   "action":{{"kind":"set_cell_text","new_value":"<새 값>"}}}}
-   (헤더로 지정 시 cell_by_header: {{"strategy":"cell_by_header","header_name":"<헤더>","row_index":1,"row_mode":"data_row"}})
+   - 신청서/양식처럼 "항목명 | 값" 구조면 cell_by_label을 우선 사용(병합셀에 강함):
+     {{"strategy":"cell_by_label","label_text":"<항목명 예: 과제명>","direction":"right"}}  (direction: right/below/left/above)
+   - 헤더 표는 cell_by_header: {{"strategy":"cell_by_header","header_name":"<헤더>","row_index":1,"row_mode":"data_row"}}
+   - row/col 숫자 지정은 병합 없는 단순표에서만 신뢰성 높음(병합셀은 cell_by_label 권장).
 3) 이미지 교체
 {{"type":"image_replace","min_confidence":0.8,"ambiguity_policy":"fail",
   "target":{{"selector_chain":[{{"strategy":"image_by_index","image_index":<N>}}]}},

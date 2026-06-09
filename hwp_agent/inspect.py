@@ -82,16 +82,39 @@ def build_index(hwp) -> Dict[str, Any]:
     text = _norm(_full_text(hwp))
     ctrl_counts = _count_ctrls(hwp)
 
+    # Count tables by walking ctrls (UserDesc == "표"), matching how
+    # get_into_nth_table / table_to_df number tables (0-based). Then read each;
+    # pyhwpx's table_to_df can raise IndexError on some complex/merged tables, so
+    # we record a stub for unreadable ones instead of breaking (which would drop
+    # every later table). table_n stays aligned with get_into_nth_table(n).
+    n_tables = 0
+    ctrl = getattr(hwp, "HeadCtrl", None)
+    while ctrl is not None:
+        if getattr(ctrl, "UserDesc", "") == "표":
+            n_tables += 1
+        ctrl = getattr(ctrl, "Next", None)
+
+    # table_to_df costs ~0.3-0.8s/table, so cap full reads to stay responsive on
+    # form-heavy docs (some have 180+ tables). Beyond the cap, record shape-less
+    # stubs (still targetable by index; content read on demand by the caller).
+    max_full = 80
     tables: List[Dict[str, Any]] = []
-    n = 1
-    while True:
+    for n in range(n_tables):  # 0-based, aligned with get_into_nth_table(n)
+        if n >= max_full:
+            tables.append({
+                "table_n": n, "shape": {"rows": 0, "cols": 0}, "headers": [],
+                "fingerprint": f"tbl:not-read:{n}", "sample_rows": [],
+                "merged_cells_detected": None, "not_read": True,
+            })
+            continue
         try:
             tables.append(_table_info(hwp, n))
         except Exception:
-            break
-        n += 1
-        if n > 500:  # safety cap
-            break
+            tables.append({
+                "table_n": n, "shape": {"rows": 0, "cols": 0}, "headers": [],
+                "fingerprint": f"tbl:unreadable:{n}", "sample_rows": [],
+                "merged_cells_detected": None, "unreadable": True,
+            })
 
     images: List[Dict[str, Any]] = []
     ordinal = 0

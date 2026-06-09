@@ -46,51 +46,101 @@ def _run(hwp, action: str) -> bool:
 
 
 def _cell_value(hwp, table_n: int, row1: int, col1: int) -> str:
-    df = hwp.table_to_df(table_n)
+    """Cell value in *physical-row* coordinates: row 1 == the table's first row
+    (header). This MUST match goto_addr / _set_table_cell / _find_label_rc, which
+    all use physical addresses -- table_to_df promotes row 0 to df.columns, so
+    df.iloc would be off by one row for the header. Use the full grid instead."""
+    g = _grid(hwp, table_n)
     r0, c0 = row1 - 1, col1 - 1
-    if r0 < 0 or c0 < 0 or r0 >= len(df.index) or c0 >= df.shape[1]:
+    if r0 < 0 or c0 < 0 or not g or r0 >= len(g) or c0 >= len(g[0]):
         raise IndexError(f"cell out of range t={table_n} r={row1} c={col1}")
-    return _norm(df.iloc[r0, c0])
+    return _norm(g[r0][c0])
 
 
-def _cell_rc(hwp):
-    """Current cell as (row, col) 1-based from get_cell_addr('A1'), or None."""
-    try:
-        a = hwp.get_cell_addr("str")
-    except Exception:
-        return None
-    m = re.match(r"([A-Za-z]+)(\d+)", a or "")
-    if not m:
-        return None
-    col = 0
-    for ch in m.group(1).upper():
-        col = col * 26 + (ord(ch) - 64)
-    return (int(m.group(2)), col)
+def _excel_addr(row1: int, col1: int) -> str:
+    """1-based (row, col) -> Excel-style address, e.g. (2, 2) -> 'B2'."""
+    s, c = "", col1
+    while c > 0:
+        c, r = divmod(c - 1, 26)
+        s = chr(65 + r) + s
+    return f"{s}{row1}"
 
 
 def _set_table_cell(hwp, table_n: int, row1: int, col1: int, value: str) -> None:
-    """Navigate to (row1,col1) by walking cells in document order (Tab/TableRightCell
-    wraps rows), matching get_cell_addr — robust to ambient cursor state. Merged
-    cells have no distinct address for inner coords -> raises (caught upstream)."""
-    hwp.get_into_nth_table(table_n, select_cell=True)  # enter table, first cell selected
-    target = (row1, col1)
-    seen, steps = set(), 0
-    cur = _cell_rc(hwp)
-    while cur != target:
-        if cur is not None:
-            if cur in seen:
-                raise RuntimeError(f"cell {target} not reachable (cycled at {cur})")
-            seen.add(cur)
-        if not _run(hwp, "TableRightCell"):
-            raise RuntimeError("TableRightCell failed")
-        steps += 1
-        if steps > 2000:
-            raise RuntimeError(f"cell {target} unreachable after {steps} steps")
-        cur = _cell_rc(hwp)
-    # select this cell's content and replace it
-    _run(hwp, "TableCellBlock")
+    """Write a cell value reliably (verified against merge-free and merged tables).
+
+    Two pyhwpx facts make this work where the naive approach fails:
+      1) goto_addr() is merge-aware (expands merged spans internally) and lands on
+         the exact addressed cell -- unlike a manual TableRightCell walk, which
+         miscounts across merged cells.
+      2) On a *cell-block* selection (select_cell=True), Run("Delete") does NOT
+         clear the cell text (it leaves residue, new text gets prepended). So we
+         instead put the caret inside the cell, select its text content with
+         MoveListBegin + MoveSelListEnd, Delete that, then insert.
+    A merged/out-of-range address makes goto_addr return False -> raise (the caller
+    records APPLY_FAILED; the post-write auto-verify is an additional guard)."""
+    hwp.get_into_nth_table(table_n)  # caret into table 1st cell, deselected (is_cell True)
+    if not hwp.goto_addr(_excel_addr(row1, col1), select_cell=False):
+        raise RuntimeError(f"goto_addr {_excel_addr(row1, col1)} failed "
+                           f"(cell merged or out of range in table {table_n})")
+    _clear_cell_and_type(hwp, value)
+
+
+def _clear_cell_and_type(hwp, value: str) -> None:
+    """Caret is inside the target cell: select its text content and replace.
+    (Run('Delete') on a *cell-block* selection leaves residue, so we select the
+    cell's text list instead -- MoveListBegin..MoveSelListEnd -- then Delete.)"""
+    _run(hwp, "MoveListBegin")
+    _run(hwp, "MoveSelListEnd")
     _run(hwp, "Delete")
     hwp.insert_text(value)
+    _run(hwp, "Cancel")
+
+
+def _grid(hwp, table_n: int) -> List[List[str]]:
+    """Full cell grid (header row + data rows) as normalized strings. Merged cells
+    appear as their repeated value (pyhwpx fills the span), which is what label
+    search wants."""
+    df = hwp.table_to_df(table_n)
+    return [[_norm(x) for x in df.columns.tolist()]] + \
+           [[_norm(x) for x in df.iloc[i].tolist()] for i in range(len(df))]
+
+
+def _find_label_rc(grid: List[List[str]], label: str, contains: bool = True):
+    """First (row1, col1) 1-based whose cell text matches label, or None."""
+    lab = _norm(label)
+    for ri, row in enumerate(grid):
+        for ci, val in enumerate(row):
+            if (lab in val) if contains else (val == lab):
+                return (ri + 1, ci + 1)
+    return None
+
+
+def _set_cell_by_label(hwp, table_n: int, label: str, direction: str, value: str):
+    """Fill the cell adjacent to a label cell (robust for merged 'label | value'
+    forms): find the (non-merged) label cell, goto its address, step into the
+    neighbour, then replace. Returns (label_rc, target_rc, landed_addr)."""
+    grid = _grid(hwp, table_n)
+    rc = _find_label_rc(grid, label)
+    if rc is None:
+        raise RuntimeError(f"label {label!r} not found in table {table_n}")
+    lr, lc = rc
+    hwp.get_into_nth_table(table_n)
+    if not hwp.goto_addr(_excel_addr(lr, lc), select_cell=False):
+        raise RuntimeError(f"goto label cell {_excel_addr(lr, lc)} failed (label cell merged?)")
+    act = {"right": "TableRightCell", "below": "TableLowerCell",
+           "left": "TableLeftCell", "above": "TableUpperCell"}.get(direction, "TableRightCell")
+    if not _run(hwp, act):
+        raise RuntimeError(f"move {act} from label failed")
+    landed = None
+    try:
+        landed = hwp.get_cell_addr("str")
+    except Exception:
+        pass
+    _clear_cell_and_type(hwp, value)
+    target_rc = {"right": (lr, lc + 1), "below": (lr + 1, lc),
+                 "left": (lr, lc - 1), "above": (lr - 1, lc)}.get(direction, (lr, lc + 1))
+    return rc, target_rc, landed
 
 
 # ---- selector resolution ---------------------------------------------------
@@ -197,27 +247,65 @@ def resolve_and_apply(hwp, index: Dict[str, Any], op: Dict[str, Any], dry_run: b
         cell_sel = next((s for s in selectors if s.get("strategy", "").startswith("cell_")), None)
         if not cell_sel:
             result["code"] = "BAD_SELECTOR"; result["errors"].append("missing cell selector"); return result
+        tn = table["table_n"]
+        new_value = _norm(action.get("new_value", ""))
+
+        # --- label-anchored cell (robust for merged 'label | value' forms) ---
+        if cell_sel.get("strategy") == "cell_by_label":
+            label = cell_sel.get("label_text", "") or cell_sel.get("header_name", "")
+            direction = cell_sel.get("direction", "right")
+            try:
+                grid = _grid(hwp, tn)
+                rc = _find_label_rc(grid, label)
+                if rc is None:
+                    result["code"] = "RESOLVE_FAILED"
+                    result["errors"].append(f"label not found: {label!r}"); return result
+                tr, tc = {"right": (rc[0], rc[1] + 1), "below": (rc[0] + 1, rc[1]),
+                          "left": (rc[0], rc[1] - 1), "above": (rc[0] - 1, rc[1])}.get(direction, (rc[0], rc[1] + 1))
+                before = grid[tr - 1][tc - 1] if (1 <= tr <= len(grid) and grid and 1 <= tc <= len(grid[0])) else ""
+            except Exception as e:
+                result["code"] = "RESOLVE_FAILED"; result["errors"].append(str(e)); return result
+            if dry_run or op.get("dry_run"):
+                result.update(ok=True, code="DRY_RUN",
+                              details={**result["details"], "table_n": tn, "label": label,
+                                       "direction": direction, "target": [tr, tc], "before": before, "after": new_value})
+                return result
+            try:
+                _, target_rc, landed = _set_cell_by_label(hwp, tn, label, direction, new_value)
+                after = _cell_value(hwp, tn, target_rc[0], target_rc[1])
+            except Exception as e:
+                result["code"] = "APPLY_FAILED"; result["errors"].append(str(e)); return result
+            result["details"].update(table_n=tn, label=label, direction=direction,
+                                     target=list(target_rc), landed=landed, before=before, after=after)
+            if _norm(after) != _norm(new_value):
+                result["code"] = "VERIFY_FAILED"
+                result["errors"].append(f"cell after write = {after!r} != {new_value!r}"); return result
+            ok, errs = _check_conditions(hwp, op.get("postconditions"), {"cell_after": after, "target_exists": True})
+            if not ok:
+                result["code"] = "POSTCONDITION_FAILED"; result["errors"] += errs; return result
+            result.update(ok=True, applied=True, code="OK"); return result
+
+        # --- positional cell (row/col or header) ---
         try:
             row1, col1 = _resolve_cell(table, cell_sel)
-            before = _cell_value(hwp, table["table_n"], row1, col1)
+            before = _cell_value(hwp, tn, row1, col1)
         except Exception as e:
             result["code"] = "RESOLVE_FAILED"; result["errors"].append(str(e)); return result
         expected = _norm(cell_sel.get("expected_current_value", ""))
         if expected and _norm(before) != expected:
             result["code"] = "EXPECTED_MISMATCH"
             result["errors"].append(f"{before!r} != {expected!r}"); return result
-        new_value = _norm(action.get("new_value", ""))
         if dry_run or op.get("dry_run"):
             result.update(ok=True, code="DRY_RUN",
-                          details={**result["details"], "table_n": table["table_n"], "row": row1, "col": col1,
+                          details={**result["details"], "table_n": tn, "row": row1, "col": col1,
                                    "before": before, "after": new_value})
             return result
         try:
-            _set_table_cell(hwp, table["table_n"], row1, col1, new_value)
-            after = _cell_value(hwp, table["table_n"], row1, col1)
+            _set_table_cell(hwp, tn, row1, col1, new_value)
+            after = _cell_value(hwp, tn, row1, col1)
         except Exception as e:
             result["code"] = "APPLY_FAILED"; result["errors"].append(str(e)); return result
-        result["details"].update(table_n=table["table_n"], row=row1, col=col1, before=before, after=after)
+        result["details"].update(table_n=tn, row=row1, col=col1, before=before, after=after)
         if _norm(after) != _norm(new_value):  # auto-verify the write landed in the right cell
             result["code"] = "VERIFY_FAILED"
             result["errors"].append(f"cell after write = {after!r} != {new_value!r}")

@@ -75,7 +75,8 @@ def test_text_find_replace_dry_run_and_not_found():
 
 def test_table_set_cell_dry_run_by_header():
     idx = _index_one_table()
-    df = pd.DataFrame([["항목", "금액"], ["수수료", "120,000"], ["세금", "0"]])
+    # table_to_df promotes the first table row to df.columns, so model that here.
+    df = pd.DataFrame([["수수료", "120,000"], ["세금", "0"]], columns=["항목", "금액"])
     op = {"op_id": "c1", "type": "table_set_cell", "min_confidence": 0.5,
           "target": {"selector_chain": [
               {"strategy": "table_by_index", "table_index": 1},
@@ -90,7 +91,7 @@ def test_table_set_cell_dry_run_by_header():
 
 def test_table_set_cell_expected_mismatch():
     idx = _index_one_table()
-    df = pd.DataFrame([["항목", "금액"], ["수수료", "999"]])
+    df = pd.DataFrame([["수수료", "999"]], columns=["항목", "금액"])
     op = {"op_id": "c2", "type": "table_set_cell", "min_confidence": 0.5,
           "target": {"selector_chain": [
               {"strategy": "table_by_index", "table_index": 1},
@@ -110,6 +111,35 @@ def test_table_low_confidence_gate():
           "action": {"new_value": "x"}}
     r = edit_ops.resolve_and_apply(_FakeHwp(pd.DataFrame([["a"]])), idx, op, dry_run=True)
     assert not r["ok"] and r["code"] == "LOW_CONFIDENCE"  # index match scores 0.70 < 0.99
+
+
+# ---- table cell address + label resolver (pure) ----
+
+def test_excel_addr():
+    assert edit_ops._excel_addr(1, 1) == "A1"
+    assert edit_ops._excel_addr(2, 2) == "B2"
+    assert edit_ops._excel_addr(3, 27) == "AA3"
+
+
+def test_find_label_rc():
+    grid = [["과제명", "기존값"], ["신청기업", "회사"]]
+    assert edit_ops._find_label_rc(grid, "과제명") == (1, 1)
+    assert edit_ops._find_label_rc(grid, "신청기업") == (2, 1)
+    assert edit_ops._find_label_rc(grid, "없음") is None
+
+
+def test_table_set_cell_by_label_dry_run():
+    idx = _index_one_table()
+    df = pd.DataFrame([["dummy1", "dummy2"]], columns=["과제명", "기존값"])
+    op = {"op_id": "L1", "type": "table_set_cell", "min_confidence": 0.5,
+          "target": {"selector_chain": [
+              {"strategy": "table_by_index", "table_index": 1},
+              {"strategy": "cell_by_label", "label_text": "과제명", "direction": "right"}]},
+          "action": {"new_value": "AX 디바이스 사업"}}
+    r = edit_ops.resolve_and_apply(_FakeHwp(df), idx, op, dry_run=True)
+    assert r["ok"] and r["code"] == "DRY_RUN"
+    assert r["details"]["target"] == [1, 2]
+    assert r["details"]["before"] == "기존값" and r["details"]["after"] == "AX 디바이스 사업"
 
 
 # ---- llm plan building (fake llm) ----
