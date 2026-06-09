@@ -1,0 +1,6 @@
+# hwp-agent dependencies (Windows + Hancom Office only).
+# COM automation requires a Windows PC with 한컴오피스(한글) installed.
+pyhwpx==1.7.2
+pywin32>=311
+google-genai
+pandas
